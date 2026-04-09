@@ -1,0 +1,24 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  width: 380px;
+  height: 520px;
+  overflow: hidden;
+}
+
+#root {
+  width: 380px;
+  height: 520px;
+  display: flex;
+  flex-direction: column;
+  background: white;
+}
