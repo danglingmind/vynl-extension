@@ -6,7 +6,7 @@ export default defineConfig({
   manifest: {
     name: 'Vynl — Webpage Capture',
     description: 'Capture any webpage into your Vynl project with one click. Save live pages, localhost builds, and staging sites instantly.',
-    version: '1.0.2',
+    version: '1.0.3',
     permissions: ['activeTab', 'scripting', 'storage', 'tabs'],
     host_permissions: [
       'https://vynl.in/*',

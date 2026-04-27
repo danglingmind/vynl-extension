@@ -1,6 +1,6 @@
 {
   "name": "vynl-extension",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Vynl browser extension — capture any webpage into a Vynl project",
   "private": true,
   "type": "module",
