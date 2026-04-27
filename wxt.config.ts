@@ -9,7 +9,8 @@ export default defineConfig({
     version: '1.0.2',
     permissions: ['activeTab', 'scripting', 'storage', 'tabs'],
     host_permissions: [
-      'https://vynl.in/*'
+      'https://vynl.in/*',
+      'file:///*'
     ],
     action: {
       default_popup: 'popup/index.html',
