@@ -52,15 +52,47 @@ export class ApiError extends Error {
 }
 
 // ---------------------------------------------------------------------------
+// Compression helper
+// ---------------------------------------------------------------------------
+
+async function gzipString(data: string): Promise<Uint8Array> {
+  const stream = new CompressionStream('gzip')
+  const writer = stream.writable.getWriter()
+  writer.write(new TextEncoder().encode(data))
+  writer.close()
+  const chunks: Uint8Array[] = []
+  const reader = stream.readable.getReader()
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    chunks.push(value)
+  }
+  const out = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0))
+  let offset = 0
+  for (const chunk of chunks) { out.set(chunk, offset); offset += chunk.length }
+  return out
+}
+
+// ---------------------------------------------------------------------------
 // Core fetch helper
 // ---------------------------------------------------------------------------
 
 async function apiFetch<T>(path: string, token: string, options?: RequestInit): Promise<T> {
+  let body = options?.body
+  const extraHeaders: Record<string, string> = {}
+
+  if (options?.method === 'POST' && typeof body === 'string') {
+    body = await gzipString(body)
+    extraHeaders['Content-Encoding'] = 'gzip'
+  }
+
   const res = await fetch(`${APP_ORIGIN}${path}`, {
     ...options,
+    body,
     headers: {
       Authorization: `Bearer ${token}`,
       'Content-Type': 'application/json',
+      ...extraHeaders,
       ...options?.headers
     }
   })
