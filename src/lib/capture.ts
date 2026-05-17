@@ -15,39 +15,19 @@ export async function captureHtml(tabId: number): Promise<string> {
  * Injected into the target tab. Must be self-contained — no imports, no closures.
  *
  * Steps:
- *  0. Wait for page load + network idle (mirrors Cloudflare Puppeteer worker)
+ *  0. Wait for page load + network idle
  *  1. Scroll through page to trigger IntersectionObserver-based lazy loads
- *  2. Serialize CSSOM rules into inline <style> tags (replaces <link> sheets too)
- *     For local pages: also inline CSS url() references as base64 data URIs
- *  3. For local pages: inline <img> and <source> src attributes as base64
+ *  2. Serialize CSSOM rules into inline <style> tags; absolutize url() references
+ *     using each stylesheet's own href as the base (fixes relative paths in external
+ *     sheets). For local pages, additionally inline as base64 data URIs.
+ *  3. Inline ALL <img>, <picture><source>, and <input type="image"> as base64
+ *     data URIs. Uses canvas for already-loaded images (avoids re-fetch and works
+ *     around CORS for same-origin images); falls back to fetch; falls back to
+ *     absolutized URL. Also clears srcset/sizes so the viewer uses the inlined src.
  *  4. Assign vynl-id to every element
- *  5. Inject <base> tag (always prepend, matching Cloudflare worker)
- *     For local pages: base href is set to empty to avoid localhost references
+ *  5. Inject <base> tag
  *  6. Inject vynl-id re-applicator script
  *  7. Serialize and return outerHTML
- *
- * Why we inline assets for local pages:
- *   When capturing localhost or file:// pages, the Vynl viewer cannot fetch
- *   resources from those origins. We must embed CSS and images directly into
- *   the HTML as inline <style> tags and base64 data URIs so the capture is
- *   fully self-contained. For remote (https) pages the viewer can reach the
- *   assets directly, so inlining is skipped to keep payload size small.
- *
- * Why we NO LONGER neutralize scripts:
- *   The Cloudflare Puppeteer worker never neutralized scripts — and it produces
- *   correct output. Neutralizing all scripts broke Showit's JS-driven parallax,
- *   scroll animations, and other effects. Instead, we inject a re-applicator
- *   script (Step 6) that re-traverses and re-assigns vynl-ids after frameworks
- *   finish rendering in the viewer (using MutationObserver + post-load passes).
- *   Since Showit/React render the same DOM structure deterministically from the
- *   same data, the re-applicator produces identical vynl-id numbering, keeping
- *   annotations stable.
- *
- * Why CSSOM serialization is critical:
- *   Frameworks like Showit call CSSStyleSheet.insertRule() to inject CSS rules
- *   without touching <style> tag textContent. outerHTML silently misses those
- *   rules. We serialize the CSSOM back to textContent before capture so all
- *   CSS is present in the static HTML, even before scripts re-run in the viewer.
  */
 async function capturePageHtml(): Promise<string> {
   const doc = document
@@ -55,7 +35,7 @@ async function capturePageHtml(): Promise<string> {
     /^(localhost|127\.0\.0\.1|0\.0\.0\.0|::1)$/.test(location.hostname) ||
     location.protocol === 'file:'
 
-  // ── Helpers (only used for local pages) ──────────────────────────────────
+  // ── Helpers ──────────────────────────────────────────────────────────────
 
   async function toDataUri(url: string): Promise<string | null> {
     try {
@@ -73,32 +53,54 @@ async function capturePageHtml(): Promise<string> {
     }
   }
 
-  async function inlineCssUrls(css: string): Promise<string> {
-    type UrlMatch = { start: number; end: number; rawUrl: string }
+  // Canvas approach works for same-origin images that are already loaded,
+  // without requiring a re-fetch or CORS headers.
+  function imgElementToDataUri(img: HTMLImageElement): string | null {
+    if (!img.complete || img.naturalWidth === 0) return null
+    try {
+      const canvas = doc.createElement('canvas')
+      canvas.width = img.naturalWidth
+      canvas.height = img.naturalHeight
+      const ctx = canvas.getContext('2d')
+      if (!ctx) return null
+      ctx.drawImage(img, 0, 0)
+      return canvas.toDataURL()
+    } catch {
+      return null // Tainted canvas for cross-origin images without CORS headers
+    }
+  }
+
+  // Resolve url() references in CSS text against the stylesheet's own URL.
+  // inline=true: convert to base64 data URIs (local pages).
+  // inline=false: just absolutize so relative refs survive stylesheet inlining.
+  async function processCssUrls(css: string, baseUrl: string, inline: boolean): Promise<string> {
     const urlRegex = /url\(\s*(['"]?)(?!data:)(?!#)([^'")]+)\1\s*\)/g
-    const matches: UrlMatch[] = []
+    const matches: { start: number; end: number; rawUrl: string; quote: string }[] = []
     let m: RegExpExecArray | null
     while ((m = urlRegex.exec(css)) !== null) {
-      matches.push({ start: m.index, end: m.index + m[0].length, rawUrl: m[2].trim() })
+      matches.push({ start: m.index, end: m.index + m[0].length, rawUrl: m[2].trim(), quote: m[1] })
     }
     if (matches.length === 0) return css
 
-    const dataUris = await Promise.all(
-      matches.map(({ rawUrl }) => {
-        try {
-          return toDataUri(new URL(rawUrl, location.href).href)
-        } catch {
-          return Promise.resolve(null)
+    const replacements = await Promise.all(
+      matches.map(async ({ rawUrl, quote }) => {
+        let absUrl: string
+        try { absUrl = new URL(rawUrl, baseUrl).href } catch { return null }
+        if (inline) {
+          const dataUri = await toDataUri(absUrl)
+          // If inlining fails, fall back to absolutized URL so it's not broken
+          return dataUri ? `url(${dataUri})` : `url(${quote}${absUrl}${quote})`
         }
+        return `url(${quote}${absUrl}${quote})`
       })
     )
 
     let result = css
     for (let i = matches.length - 1; i >= 0; i--) {
-      const dataUri = dataUris[i]
-      if (dataUri) {
+      const r = replacements[i]
+      if (r) {
         const { start, end } = matches[i]
-        result = result.slice(0, start) + `url(${dataUri})` + result.slice(end)
+        result = result.slice(0, start) + r + result.slice(end)
       }
     }
     return result
@@ -146,9 +148,11 @@ async function capturePageHtml(): Promise<string> {
   await waitForIdle(800, 5000)
 
   // ── Step 2: Serialize CSSOM rules into inline <style> tags ────────────────
-  // For <link> stylesheets: replace the <link> with an inline <style> so the
-  // viewer never needs to fetch external CSS (critical for local pages; also
-  // picks up insertRule() additions on remote pages).
+  // For <link> stylesheets: replace the <link> with an inline <style>.
+  // url() references are absolutized using the sheet's own href so that
+  // relative paths (e.g. url('../fonts/icon.woff') in an external sheet)
+  // continue to resolve correctly after inlining. For local pages, they are
+  // additionally converted to base64 data URIs for full self-containment.
   await Promise.all(
     Array.from(doc.styleSheets).map(async sheet => {
       try {
@@ -157,8 +161,9 @@ async function capturePageHtml(): Promise<string> {
         const rules = Array.from(sheet.cssRules)
         if (rules.length === 0) return
 
+        const sheetBase = (sheet as CSSStyleSheet).href || location.href
         let cssText = rules.map(r => r.cssText).join('\n')
-        if (isLocal) cssText = await inlineCssUrls(cssText)
+        cssText = await processCssUrls(cssText, sheetBase, isLocal)
 
         if (owner.tagName === 'STYLE') {
           ;(owner as HTMLStyleElement).textContent = cssText
@@ -187,30 +192,76 @@ async function capturePageHtml(): Promise<string> {
   }
   if (adoptedCSSParts.length > 0) {
     let adoptedCSS = adoptedCSSParts.join('\n')
-    if (isLocal) adoptedCSS = await inlineCssUrls(adoptedCSS)
+    adoptedCSS = await processCssUrls(adoptedCSS, location.href, isLocal)
     const style = doc.createElement('style')
     style.setAttribute('data-vynl', 'adopted-cssom')
     style.textContent = adoptedCSS
     doc.head?.appendChild(style)
   }
 
-  // ── Step 3: Inline images for local pages ────────────────────────────────
-  // The Vynl viewer cannot reach localhost or file:// origins, so any <img>
-  // or <source> src that points there must be embedded as a base64 data URI.
-  if (isLocal) {
-    await Promise.all(
-      Array.from(doc.querySelectorAll<HTMLElement>('img[src], source[src], input[type="image"][src]')).map(
-        async el => {
-          const src = el.getAttribute('src')
-          if (!src || src.startsWith('data:') || src.startsWith('#')) return
-          try {
-            const dataUri = await toDataUri(new URL(src, location.href).href)
-            if (dataUri) el.setAttribute('src', dataUri)
-          } catch {}
+  // ── Step 3: Inline all images as base64 data URIs ────────────────────────
+  // Done for ALL pages (not just local). The viewer cannot reliably load images
+  // from their original origins due to CSP, CORS, CDN restrictions, or auth.
+  // Strategy for <img>:
+  //   1. Use currentSrc (browser's actual chosen URL — handles srcset selection)
+  //   2. Try canvas on the already-loaded element (same-origin, no re-fetch)
+  //   3. Fall back to fetch (cross-origin with CORS headers)
+  //   4. Fall back to absolutized URL so at least relative paths don't break
+  // srcset/sizes are cleared so the viewer uses the single inlined src.
+  await Promise.all([
+    ...Array.from(doc.querySelectorAll<HTMLImageElement>('img')).map(async img => {
+      // currentSrc is the browser's resolved URL (picks from srcset if applicable)
+      const url = img.currentSrc || img.src
+      if (!url || url.startsWith('data:') || url.startsWith('#')) return
+
+      let dataUri: string | null = imgElementToDataUri(img)
+      if (!dataUri) dataUri = await toDataUri(url)
+
+      if (dataUri) {
+        img.setAttribute('src', dataUri)
+      } else {
+        // Absolutize so relative src values don't break in viewer
+        try { img.setAttribute('src', new URL(url, location.href).href) } catch {}
+      }
+      img.removeAttribute('srcset')
+      img.removeAttribute('sizes')
+    }),
+
+    // <picture><source srcset="..."> — pick highest-resolution entry and inline
+    ...Array.from(doc.querySelectorAll<HTMLSourceElement>('picture source')).map(async el => {
+      const srcset = el.getAttribute('srcset')
+      const src = el.getAttribute('src')
+      // Last entry in srcset is typically the highest resolution
+      const rawUrl = srcset
+        ? srcset.split(',').map((s: string) => s.trim().split(/\s+/)[0]).filter(Boolean).pop() || ''
+        : src || ''
+      if (!rawUrl || rawUrl.startsWith('data:')) return
+      try {
+        const abs = new URL(rawUrl, location.href).href
+        const dataUri = await toDataUri(abs)
+        if (dataUri) {
+          el.setAttribute('src', dataUri)
+        } else {
+          el.setAttribute('src', abs)
         }
-      )
-    )
-  }
+        el.removeAttribute('srcset')
+        el.removeAttribute('sizes')
+        el.removeAttribute('type')
+      } catch {}
+    }),
+
+    // <input type="image">
+    ...Array.from(doc.querySelectorAll<HTMLInputElement>('input[type="image"][src]')).map(async el => {
+      const src = el.getAttribute('src')
+      if (!src || src.startsWith('data:') || src.startsWith('#')) return
+      try {
+        const abs = new URL(src, location.href).href
+        const dataUri = await toDataUri(abs)
+        if (dataUri) el.setAttribute('src', dataUri)
+        else el.setAttribute('src', abs)
+      } catch {}
+    }),
+  ])
 
   // ── Step 4: Assign vynl-id to every element ──────────────────────────────
   let counter = 1
@@ -233,10 +284,9 @@ async function capturePageHtml(): Promise<string> {
   })
 
   // ── Step 5: Base tag ──────────────────────────────────────────────────────
-  // For remote pages: prepend with the full origin+pathname so relative asset
-  // URLs resolve correctly in the viewer (matches Cloudflare worker behavior).
-  // For local pages: omit href — assets are already inlined as data URIs above,
-  // and a localhost base href would cause broken-resource noise in the viewer.
+  // For remote pages: prepend with the full origin+pathname so any remaining
+  // relative asset URLs resolve correctly in the viewer.
+  // For local pages: omit href — assets are already inlined as data URIs above.
   const base = doc.createElement('base')
   if (!isLocal) {
     base.href = location.origin + location.pathname + location.search

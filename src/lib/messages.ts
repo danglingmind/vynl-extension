@@ -1,4 +1,4 @@
-import type { VynlFile, Workspace, SnapshotPayload } from '../api/vynl'
+import type { VynlFile, Workspace, PreparePayload } from '../api/vynl'
 
 // ---------------------------------------------------------------------------
 // Messages sent FROM the popup TO the background
@@ -6,7 +6,7 @@ import type { VynlFile, Workspace, SnapshotPayload } from '../api/vynl'
 
 export type ExtensionMessage =
   | { type: 'GET_PROJECTS' }
-  | { type: 'CAPTURE'; tabId: number; payload: Omit<SnapshotPayload, 'htmlContent'> }
+  | { type: 'CAPTURE'; tabId: number; payload: PreparePayload }
 
 // ---------------------------------------------------------------------------
 // Responses sent FROM the background TO the popup

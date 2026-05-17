@@ -1,6 +1,6 @@
 import { getClerkToken, clearCachedToken } from '../lib/auth'
 import { captureHtml } from '../lib/capture'
-import { fetchProjects, pushSnapshot, ApiError } from '../api/vynl'
+import { fetchProjects, prepareSnapshot, uploadHtmlToSupabase, commitSnapshot, ApiError } from '../api/vynl'
 import type { ExtensionMessage, ExtensionResponse } from '../lib/messages'
 
 export default defineBackground(() => {
@@ -50,29 +50,30 @@ async function handleCapture(
   token: string,
   msg: Extract<ExtensionMessage, { type: 'CAPTURE' }>
 ): Promise<ExtensionResponse> {
-  // Capture the HTML from the target tab
   let htmlContent: string
   try {
     htmlContent = await captureHtml(msg.tabId)
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
-    // CSP or scripting permission errors
     if (message.includes('Cannot access') || message.includes('blocked')) {
       return { type: 'ERROR', message: 'This page blocked the capture. Try saving the page manually.' }
     }
     return { type: 'ERROR', message: 'Failed to capture page HTML.' }
   }
 
-  // Push to API — with one automatic retry on 401
-  const doUpload = (t: string) =>
-    pushSnapshot(t, { ...msg.payload, htmlContent } as Parameters<typeof pushSnapshot>[1])
+  console.log(`[vynl] captured HTML size: ${(new TextEncoder().encode(htmlContent).length / 1024 / 1024).toFixed(2)} MB`)
+
+  const doUpload = async (t: string) => {
+    const { fileId, uploadUrl } = await prepareSnapshot(t, msg.payload)
+    await uploadHtmlToSupabase(uploadUrl, htmlContent)
+    return commitSnapshot(t, fileId, htmlContent.length)
+  }
 
   try {
     const result = await doUpload(token)
     return { type: 'CAPTURE_DONE', file: result.file }
   } catch (err) {
     if (err instanceof ApiError && err.status === 401) {
-      // Token expired mid-session — clear and retry once
       await clearCachedToken()
       const freshToken = await getClerkToken()
       if (!freshToken) return { type: 'AUTH_REQUIRED' }

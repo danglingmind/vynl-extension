@@ -6,10 +6,11 @@ export default defineConfig({
   manifest: {
     name: 'Vynl — Webpage Capture',
     description: 'Capture any webpage into your Vynl project with one click. Save live pages, localhost builds, and staging sites instantly.',
-    version: '1.0.5',
+    version: '1.0.6',
     permissions: ['activeTab', 'scripting', 'storage', 'tabs'],
     host_permissions: [
       'https://vynl.in/*',
+      'https://*.supabase.co/*',
       'file:///*'
     ],
     action: {

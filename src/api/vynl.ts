@@ -36,9 +36,18 @@ export interface VynlFile {
 
 export type Viewport = 'DESKTOP' | 'TABLET' | 'MOBILE'
 
-export type SnapshotPayload =
-  | { projectId: string; parentFileId?: never; title: string; url: string; htmlContent: string; viewport?: Viewport }
-  | { parentFileId: string; projectId?: never; title: string; url: string; htmlContent: string; viewport?: Viewport }
+export interface PreparePayload {
+  projectId?: string
+  parentFileId?: string
+  title: string
+  url: string
+  viewport?: Viewport
+}
+
+export interface PrepareResponse {
+  fileId: string
+  uploadUrl: string
+}
 
 // ---------------------------------------------------------------------------
 // Error class
@@ -52,47 +61,15 @@ export class ApiError extends Error {
 }
 
 // ---------------------------------------------------------------------------
-// Compression helper
-// ---------------------------------------------------------------------------
-
-async function gzipString(data: string): Promise<Uint8Array> {
-  const stream = new CompressionStream('gzip')
-  const writer = stream.writable.getWriter()
-  writer.write(new TextEncoder().encode(data))
-  writer.close()
-  const chunks: Uint8Array[] = []
-  const reader = stream.readable.getReader()
-  while (true) {
-    const { done, value } = await reader.read()
-    if (done) break
-    chunks.push(value)
-  }
-  const out = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0))
-  let offset = 0
-  for (const chunk of chunks) { out.set(chunk, offset); offset += chunk.length }
-  return out
-}
-
-// ---------------------------------------------------------------------------
 // Core fetch helper
 // ---------------------------------------------------------------------------
 
 async function apiFetch<T>(path: string, token: string, options?: RequestInit): Promise<T> {
-  let body = options?.body
-  const extraHeaders: Record<string, string> = {}
-
-  if (options?.method === 'POST' && typeof body === 'string') {
-    body = await gzipString(body)
-    extraHeaders['Content-Encoding'] = 'gzip'
-  }
-
   const res = await fetch(`${APP_ORIGIN}${path}`, {
     ...options,
-    body,
     headers: {
       Authorization: `Bearer ${token}`,
       'Content-Type': 'application/json',
-      ...extraHeaders,
       ...options?.headers
     }
   })
@@ -113,12 +90,34 @@ export async function fetchProjects(token: string): Promise<{ workspaces: Worksp
   return apiFetch('/api/extension/projects', token)
 }
 
-export async function pushSnapshot(
-  token: string,
-  payload: SnapshotPayload
-): Promise<{ success: true; file: VynlFile }> {
-  return apiFetch('/api/extension/snapshot', token, {
+// Step 1 — validate access and get a signed Supabase upload URL
+export async function prepareSnapshot(token: string, payload: PreparePayload): Promise<PrepareResponse> {
+  return apiFetch<PrepareResponse>('/api/extension/snapshot/prepare', token, {
     method: 'POST',
     body: JSON.stringify(payload)
+  })
+}
+
+// Step 2 — PUT HTML directly to Supabase (no Vercel size limit)
+export async function uploadHtmlToSupabase(uploadUrl: string, html: string): Promise<void> {
+  const res = await fetch(uploadUrl, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'text/html' },
+    body: html
+  })
+  if (!res.ok) {
+    throw new ApiError(res.status, `Supabase upload failed (${res.status})`)
+  }
+}
+
+// Step 3 — mark the file READY and get the final file record
+export async function commitSnapshot(
+  token: string,
+  fileId: string,
+  fileSize: number
+): Promise<{ success: true; file: VynlFile }> {
+  return apiFetch<{ success: true; file: VynlFile }>('/api/extension/snapshot/commit', token, {
+    method: 'POST',
+    body: JSON.stringify({ fileId, fileSize })
   })
 }
